@@ -1,0 +1,9 @@
+[package]
+name = "avrs-emulator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avrs-core = { version = "0.1.0", path = "../avrs-core/" }
+thiserror = "2.0.17"
+tracing = "0.1.44"
