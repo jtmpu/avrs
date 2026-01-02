@@ -71,6 +71,7 @@ dependencies = [
 name = "avrs-asm"
 version = "0.1.0"
 dependencies = [
+ "avrs-core",
  "clap",
  "miette",
  "thiserror",

@@ -43,6 +43,13 @@ impl<const LOWEST: u16, const HIGHEST: u16, const OFFSET: u16> Unsigned<LOWEST, 
     }
 }
 
+impl<const LOWEST: u16, const HIGHEST: u16, const OFFSET: u16> TryFrom<u8> for Unsigned<LOWEST, HIGHEST, OFFSET> {
+    type Error = IntegerError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::transform(value as u16)
+    }
+}
+
 impl<const LOWEST: u16, const HIGHEST: u16, const OFFSET: u16> TryFrom<u16> for Unsigned<LOWEST, HIGHEST, OFFSET> {
     type Error = IntegerError;
     fn try_from(value: u16) -> Result<Self, Self::Error> {

@@ -1,10 +1,11 @@
 /// Grammar
 /// program     ::= { line } EOF
-/// line        ::= [ label ] [ statement ] NEWLINE
-/// label       ::= IDENT COLON
+/// line        ::= [ statement ] NEWLINE
 /// statement   ::= instruction
 ///                | directive
+///                | label
 ///
+/// label       ::= IDENT COLON
 /// instruction ::= mnemonic [ operand_list ]
 /// mnemonic    ::= IDENT
 /// operand_list ::= operand { COMMA operand }
@@ -29,6 +30,7 @@
 ///
 use std::{io::Read, num::ParseIntError};
 
+use clap::error::Result;
 use miette::SourceSpan;
 
 pub mod tagged;
@@ -36,7 +38,7 @@ pub mod lexer;
 pub mod reader;
 pub mod buflexer;
 
-use crate::parser::{buflexer::BufferedLexer, lexer::{LexerError, TokenKind}, tagged::Tagged};
+use crate::parser::{buflexer::BufferedLexer, lexer::{LexerError, Token, TokenKind}, tagged::Tagged};
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum ParserError {
@@ -61,6 +63,33 @@ pub enum ParserError {
     Lexer(#[from] LexerError),
 }
 
+#[derive(Debug)]
+pub struct Line {
+    pub label: Option<String>,
+    pub statement: Option<Statement>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug)]
+pub enum Statement {
+    Instruction(ParsedStatement),
+    Directive(ParsedStatement),
+}
+
+#[derive(Debug)]
+pub struct ParsedStatement {
+    pub name: String,
+    pub operands: Vec<Operand>,
+    pub span: SourceSpan,
+}
+
+pub type Operand = Tagged<OperandKind>;
+#[derive(Debug)]
+pub enum OperandKind {
+    Register(u8),
+    Expression(Expression),
+}
+
 type Expression = Tagged<ExpressionKind>;
 #[derive(Debug)]
 pub enum ExpressionKind {
@@ -74,26 +103,6 @@ pub enum ExpressionKind {
         op: BinaryOp,
         right: Box<Expression>,
     }
-}
-
-#[derive(Debug)]
-pub struct Label {
-    name: String,
-    span: SourceSpan,
-}
-
-#[derive(Debug)]
-pub struct Instruction {
-    name: String,
-    operands: Vec<Operand>,
-    span: SourceSpan,
-}
-
-pub type Operand = Tagged<OperandKind>;
-#[derive(Debug)]
-pub enum OperandKind {
-    Register(u8),
-    Expression(Expression),
 }
 
 impl Expression {
@@ -150,43 +159,102 @@ impl<T: Read> Parser<T> {
         Self { lexer: BufferedLexer::new(reader) }
     }
 
-    pub fn parse_instruction(&mut self) -> Result<Instruction, ParserError> {
-        let token = self.lexer.advance()?;
-        let mnemonic = match token.kind {
-            TokenKind::Identifier(value) => value,
-            _ => {
-                return Err(ParserError::UnexpectedToken { 
-                    topic: "instruction".to_string(),
-                    received: token.kind.clone(),
-                    expected: vec![TokenKind::RParen],
-                    span: token.span,
-                });
-            }
+    pub fn next(&mut self) -> miette::Result<Line> {
+        Ok(self.parse_line()?)
+    }
+
+    pub fn skip_until_end(&mut self) -> miette::Result<()> {
+        while !matches!(self.lexer.peek()?.kind, TokenKind::Newline | TokenKind::Eof) {
+            self.lexer.advance()?;
+        }
+        Ok(())
+    }
+
+    fn parse_line(&mut self) -> Result<Line, ParserError> {
+        let mut token = self.lexer.advance()?;
+        let mut span = token.span;
+        let mut label = None;
+        let mut statement = None;
+
+        // Check if there's a label
+        if let TokenKind::Identifier(value) = &token.kind && let TokenKind::Colon = self.lexer.peek()?.kind {
+            // Label
+            label.replace(value.to_string());
+            token = self.lexer.advance()?;
+            // include colon in span
+            span = combined_span(span, token.span);
+            // move cursor forward again
+            token = self.lexer.advance()?;
+        }
+
+        // Line has ended
+        if matches!(token.kind, TokenKind::Newline | TokenKind::Eof) {
+            return Ok(Line { label, statement, span });
+        }
+
+        // if line hasn't ended, and we still have a token, there must be a statement
+        statement.replace(self.parse_statement(Some(token))?);
+
+        Ok(Line {
+            label,
+            statement,
+            span,
+        })
+    }
+
+    fn parse_statement(&mut self, token: Option<Token>) -> Result<Statement, ParserError> {
+        let mut token = if let Some(token) = token {
+            token
+        } else {
+            self.lexer.advance()?
+        };
+        let initial = token.span;
+
+        let is_directive = if let TokenKind::Dot = token.kind {
+            token = self.lexer.advance()?;
+            true
+        } else {
+            false
+        };
+
+        let name = if let TokenKind::Identifier(name) = &token.kind {
+            name.to_string()
+        } else {
+            return Err(ParserError::UnexpectedToken { 
+                topic: "statement".to_string(),
+                received: token.kind.clone(),
+                expected: vec![TokenKind::Identifier(String::new())],
+                span: token.span,
+            });
         };
 
         let mut operands = Vec::new();
         while self.peek_is_operand()? {
             let op = self.parse_operand()?;
             operands.push(op);
-            
+
             let next = self.lexer.peek()?;
             if !matches!(next.kind, TokenKind::Comma) {
                 break;
             }
+
             self.lexer.advance()?;
         }
+
         let span = if let Some(op) = operands.last() {
-            combined_span(token.span, op.span)
+            combined_span(initial, op.span)
         } else {
-            token.span
+            initial
         };
 
-        let instruction = Instruction {
-            name: mnemonic,
-            operands,
-            span,
+        let parsed = ParsedStatement { name, operands, span };
+        let stmt = if is_directive {
+            Statement::Directive(parsed)
+        } else {
+            Statement::Instruction(parsed)
         };
-        Ok(instruction)
+
+        Ok(stmt)
     }
 
     fn peek_is_operand(&mut self) -> Result<bool, ParserError> {
@@ -206,9 +274,8 @@ impl<T: Read> Parser<T> {
         Ok(matches)
     }
 
-    pub fn parse_operand(&mut self) -> Result<Operand, ParserError> {
+    fn parse_operand(&mut self) -> Result<Operand, ParserError> {
         let token = self.lexer.peek()?;
-        println!("{:?}", token);
 
         let operand = match &token.kind {
             TokenKind::Register(_) => self.parse_register()?,
@@ -245,7 +312,7 @@ impl<T: Read> Parser<T> {
         }
     }
 
-    pub fn parse_expression(&mut self) -> Result<Expression, ParserError> {
+    fn parse_expression(&mut self) -> Result<Expression, ParserError> {
         self.parse_additive()
     }
 
@@ -350,7 +417,7 @@ impl<T: Read> Parser<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::{Expression, ExpressionKind, OperandKind, Parser };
+    use super::*;
 
     fn create(value: &str) -> Parser<&[u8]> {
        Parser::new(value.as_bytes())
@@ -420,31 +487,69 @@ mod tests {
     }
 
     #[test]
-    pub fn test_instruction() {
-        let mut parser = create("mov r2, r3");
-        let instr = parser.parse_instruction()
+    fn test_statement() {
+        let mut parser = create(".BYTE 4");
+        let stmt = parser.parse_statement(None)
             .unwrap();
-        assert_eq!(instr.name, "mov");
-        match instr.operands[0].kind {
-            OperandKind::Register(value) => assert_eq!(2, value),
-            _ => panic!("expected register operand, received {:?}", instr.operands[0].kind),
-        }
-        match instr.operands[1].kind {
-            OperandKind::Register(value) => assert_eq!(3, value),
-            _ => panic!("expected register operand, received {:?}", instr.operands[0].kind),
-        }
+        match &stmt {
+            Statement::Directive(body) => {
+                assert_eq!(body.name, "BYTE");
+                let op = &body.operands[0];
+                match &op.kind {
+                    OperandKind::Expression(expr) => assert_eq!(expr.evaluate(), 4),
+                    _ => panic!("expected expression, received: {:?}", op.kind),
+                }
 
-        let mut parser = create("ldi r2, (2 + (4 * 3))");
-        let instr = parser.parse_instruction()
+            }
+            _ => panic!("expected directive, received: {:?}", stmt),
+        };
+
+        let mut parser = create("ldi r2, (4 + 8)");
+        let stmt = parser.parse_statement(None)
             .unwrap();
-        assert_eq!(instr.name, "ldi");
-        match instr.operands[0].kind {
-            OperandKind::Register(value) => assert_eq!(2, value),
-            _ => panic!("expected register operand, received {:?}", instr.operands[0].kind),
-        }
-        match &instr.operands[1].kind {
-            OperandKind::Expression(value) => assert_eq!(14, value.evaluate()),
-            _ => panic!("expected register operand, received {:?}", instr.operands[0].kind),
-        }
+        match &stmt{
+            Statement::Instruction(body) => {
+                assert_eq!(body.name, "ldi");
+                let op = &body.operands[0];
+                match &op.kind {
+                    OperandKind::Register(index) => assert_eq!(*index, 2),
+                    _ => panic!("expected expression, received: {:?}", op.kind),
+                }
+                let op = &body.operands[1];
+                match &op.kind {
+                    OperandKind::Expression(expr) => assert_eq!(expr.evaluate(), 12),
+                    _ => panic!("expected expression, received: {:?}", op.kind),
+                }
+
+            }
+            _ => panic!("expected directive, received: {:?}", stmt),
+        };
+    }
+
+    #[test]
+    fn test_line() {
+        let mut parser = create("\n");
+        let line = parser.parse_line()
+            .unwrap();
+        assert!(line.label.is_none());
+        assert!(line.statement.is_none());
+
+        let mut parser = create("label:\n");
+        let line = parser.parse_line()
+            .unwrap();
+        assert_eq!("label", line.label.unwrap());
+        assert!(line.statement.is_none());
+
+        let mut parser = create("mov r2, r3\n");
+        let line = parser.parse_line()
+            .unwrap();
+        assert!(line.label.is_none());
+        assert!(line.statement.is_some());
+
+        let mut parser = create("label: .BYTE 4\n");
+        let line = parser.parse_line()
+            .unwrap();
+        assert_eq!("label", line.label.unwrap());
+        assert!(line.statement.is_some());
     }
 }
